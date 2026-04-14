@@ -1,11 +1,12 @@
 import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
+from pathlib import Path
 
 # 1. Setup the path to your ROUND 1 folder
 home_dir = Path.home()
 # UPDATE THIS to match your actual folder name (e.g., "ROUND_1")
-data_folder = home_dir / "Downloads" / "ROUND1" 
+data_folder = Path.cwd() / "data"
 
 # Define the exact file paths for all 3 days
 prices_d2_path = data_folder / "prices_round_1_day_-2.csv"
