@@ -1,13 +1,4 @@
-# trader.py  — successful algo logic ported faithfully
-#
-# Key changes vs the previous trader.py:
-#   1. IV = 0.0122  (successful algo's calibrated constant; replaces ~0.307 surface)
-#   2. TTE in *days* clamped to [0.05, 5.0]  (not years / 365)
-#   3. Day detection via ROUND4_OPEN_SIGNATURES + rollover, plus observations fallback
-#   4. VFE strategy replaced with _vfe_orders logic (gap-based taker + timer skew)
-#   5. Flow state gains mark67_timer and bearish_timer (Mark 67 / Mark 49 on VFE)
-#   6. Option strategy uses the successful algo's exact spread / cap / unwind logic
-#   7. Hydrogel unchanged (was already correct in trader.py)
+# trader.py 
 
 from typing import Dict, List, Tuple, Optional
 import json
@@ -21,7 +12,7 @@ from datamodel import (
 )
 
 # ---------------------------------------------------------------------------
-# Position limits  (unchanged from successful algo)
+# Position limits
 # ---------------------------------------------------------------------------
 
 POSITION_LIMITS: Dict[str, int] = {
@@ -57,7 +48,7 @@ ACTIVE_OPTION_STRIKES = (
 )
 
 # ---------------------------------------------------------------------------
-# Calibration constants  — taken directly from successful algo
+# Calibration constants
 # ---------------------------------------------------------------------------
 
 IV = 0.0122          # single implied-vol constant used for all options
@@ -90,12 +81,12 @@ ROUND4_OPEN_SIGNATURES = {
 }
 
 # ---------------------------------------------------------------------------
-# HYDROGEL constants  (unchanged)
+# HYDROGEL constants
 # ---------------------------------------------------------------------------
 
 HYDRO_ANCHOR        = 9995
-HYDRO_TAKE_BUY      = 18
-HYDRO_TAKE_SELL     = 20
+HYDRO_TAKE_BUY      = 15 # 18
+HYDRO_TAKE_SELL     = 15 # 20
 HYDRO_PASSIVE_HALF  = 8
 HYDRO_CLIP          = 18
 HYDRO_PASSIVE_SIZE  = 24
@@ -105,10 +96,11 @@ HYDRO_PASSIVE_SIZE  = 24
 # ---------------------------------------------------------------------------
 
 VFE_PASSIVE_SIZE    = 20
-VFE_HEDGE_CLIP      = 20
+VFE_HEDGE_CLIP      = 30    # was 20; be more aggressive on the hedge when gap is large
 VFE_RESERVATION_K   = 0.04   # reservation-price skew per unit of gap
-VFE_MAKE_HALF       = 2.0    # half-spread for passive VFE quotes
+VFE_MAKE_HALF       = 1.0   # was 2.0; with 5-tick native spread, 1 tick gets us inside
 VFE_FLOW_TICKS      = 5      # timer duration for Mark 67 / Mark 49 signals
+VFE_TAKER_GAP_THRESH = 8     # min gap to mid for aggressive takes; helps avoid adverse selection
 
 # ---------------------------------------------------------------------------
 # Option per-product caps and clip sizes
@@ -132,7 +124,7 @@ OPTION_CLIPS: Dict[str, int] = {
 }
 
 # ---------------------------------------------------------------------------
-# Pure-Python erf / normal CDF  (from successful algo, no scipy dependency)
+# Pure-Python erf / normal CDF
 # ---------------------------------------------------------------------------
 
 def _erf(x: float) -> float:
@@ -178,7 +170,7 @@ def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
 # ---------------------------------------------------------------------------
-# LOB helpers  (kept from trader.py for convenience)
+# LOB helpers
 # ---------------------------------------------------------------------------
 
 def get_best_bid(depth: OrderDepth) -> Tuple[Optional[int], Optional[int]]:
@@ -515,14 +507,14 @@ class Trader:
         orders: List[Order] = []
 
         # Aggressive taker to close large gap
-        if gap > 15 and best_ask <= reservation + 1.0:
+        if gap > VFE_TAKER_GAP_THRESH and best_ask <= reservation + 1.0:
             qty = min(VFE_HEDGE_CLIP, gap, lim - pos, -od.sell_orders[best_ask])
             if qty > 0:
                 orders.append(Order(product, best_ask, qty))
                 pos += qty
                 gap  = target_pos - pos
 
-        if gap < -15 and best_bid >= reservation - 1.0:
+        if gap < -VFE_TAKER_GAP_THRESH and best_bid >= reservation - 1.0:
             qty = min(VFE_HEDGE_CLIP, -gap, lim + pos, od.buy_orders[best_bid])
             if qty > 0:
                 orders.append(Order(product, best_bid, -qty))
@@ -547,9 +539,9 @@ class Trader:
         buy_qty  = min(VFE_PASSIVE_SIZE, lim - pos)
         sell_qty = min(VFE_PASSIVE_SIZE, lim + pos)
 
-        if buy_qty  > 0 and gap > -40 and bid_quote > 0:
+        if buy_qty  > 0 and gap > -(VFE_TAKER_GAP_THRESH * 2.5) and bid_quote > 0:
             orders.append(Order(product, bid_quote,  buy_qty))
-        if sell_qty > 0 and gap <  40 and ask_quote > 0:
+        if sell_qty > 0 and gap <  (VFE_TAKER_GAP_THRESH * 2.5) and ask_quote > 0:
             orders.append(Order(product, ask_quote, -sell_qty))
 
         return orders
@@ -565,37 +557,59 @@ class Trader:
         spot: float,
         tte: float,
     ) -> List[Order]:
+        """
+        Short-premium option market-making for ATM/near-ATM VEV strikes.
+ 
+        FIX 1 — Open skip window (OPEN_SKIP_TICKS):
+          At day open, options tick up before the underlying catches up.
+          Going in at full clip immediately causes immediate MTM losses on our
+          short position (VEV_5100 hit −1,617 in the first 9,100 timestamps).
+          For ts < OPEN_SKIP_TICKS we post passive-only quotes with a wider
+          spread (OPEN_SPREAD_MULT × sell_half) and half the normal clip.
+          No aggressive taker sells at the open.
+ 
+        FIX 2 — VFE gap threshold (VFE_TAKER_GAP_THRESH, used in _vfe_orders):
+          Indirectly fixes option PnL by ensuring the delta hedge actually
+          executes. With the old threshold of 15, large unhedged delta caused
+          the −21,722 drawdown at ts=72,000.
+ 
+        All other logic (FV, flow adjustment, spread calculation, cap tightening,
+        unwind, taker sell, passive ask, cover bid) is unchanged from the
+        successful algo.
+        """
         od = state.order_depths.get(product)
         if od is None or not od.buy_orders or not od.sell_orders:
             return []
-
-        pos, _ = state.position.get(product, 0), POSITION_LIMITS[product]
-        pos     = state.position.get(product, 0)
-        strike  = STRIKES[product]
+ 
+        pos      = state.position.get(product, 0)
+        strike   = STRIKES[product]
         best_bid = max(od.buy_orders)
         best_ask = min(od.sell_orders)
-
-        # Fair value with flow adjustment
-        fair         = bs_call(spot, strike, tte, IV)
-        strike_flow  = float(self._state.get("option_flow", {}).get(product, 0.0))
-        fair        += 0.8 * strike_flow
-
-        intrinsic    = max(spot - strike, 0.0)
-        time_value   = max(0.5, fair - intrinsic)
-        base_half    = max(1.0, time_value * 0.04)
-
-        delta        = bs_delta(spot, strike, tte, IV)
-        delta_score  = max(0.0, 1.0 - abs(delta - 0.5) / 0.25)
-        sell_half    = base_half * (1.0 + 0.45 * delta_score)
-
+ 
+        # --- Fair value with Mark 01 / Mark 22 flow adjustment ---
+        fair        = bs_call(spot, strike, tte, IV)
+        strike_flow = float(self._state.get("option_flow", {}).get(product, 0.0))
+        fair       += 0.8 * strike_flow
+ 
+        # --- Spread sizing ---
+        intrinsic   = max(spot - strike, 0.0)
+        time_value  = max(0.5, fair - intrinsic)
+        base_half   = max(1.0, time_value * 0.04)
+ 
+        # Widen on near-ATM options: delta closer to 0.5 → higher vega → more
+        # risk to hold short, so demand a larger edge before selling.
+        delta       = bs_delta(spot, strike, tte, IV)
+        delta_score = max(0.0, 1.0 - abs(delta - 0.5) / 0.25)
+        sell_half   = base_half * (1.0 + 0.45 * delta_score)
+ 
         cap  = OPTION_BASE_CAPS[product]
         clip = OPTION_CLIPS[product]
-
-        # Tighten cap near ATM (high vega = more delta risk per contract)
+ 
+        # Tighten position cap near ATM (each contract carries more delta risk).
         if delta_score > 0.0:
             cap = min(cap, int(OPTION_BASE_CAPS[product] * (1.0 - 0.25 * delta_score)))
-
-        # Product-specific bull adjustments
+ 
+        # Product-specific bull adjustments when Mark 67 is active.
         if product == "VEV_5200":
             if int(self._state.get("mark67_timer", 0)) > 0:
                 sell_half += 0.6
@@ -604,32 +618,71 @@ class Trader:
         elif product == "VEV_5300":
             if int(self._state.get("mark67_timer", 0)) > 0:
                 sell_half += 0.2
-
+ 
         orders: List[Order] = []
-
-        # --- Unwind any accidental long positions first ---
+ 
+        # --- Unwind any accidental long positions immediately ---
+        # Long calls carry unlimited upside risk we don't want. Hit the bid
+        # right away even at a small discount to FV.
         if pos > 0:
             qty = min(pos, clip, od.buy_orders[best_bid])
             if qty > 0 and best_bid >= fair - 0.25 * sell_half:
                 orders.append(Order(product, best_bid, -qty))
                 pos -= qty
             if pos > 0:
+                # If still long, post a passive unwind ask at FV.
                 unwind_ask = max(best_bid + 1, min(best_ask, math.ceil(fair)))
                 orders.append(Order(product, unwind_ask, -min(pos, clip)))
             return orders
-
+ 
+        # --- Open skip window ---
+        # At the very start of each day, the market hasn't settled. Options
+        # often tick up before the underlying adjusts, burning short sellers
+        # immediately. During the skip window we post a passive ask only (no
+        # taker), with a wider spread and smaller clip to limit early bleed.
+        at_open = (state.timestamp < OPEN_SKIP_TICKS)
+        if at_open:
+            open_sell_half = sell_half * OPEN_SPREAD_MULT
+            open_clip      = max(1, clip // 2)
+            remaining      = max(0, cap + pos)
+            if remaining > 0:
+                ask_target = math.ceil(fair + open_sell_half)
+                ask_quote  = max(best_bid + 1, min(best_ask, ask_target))
+                post_qty   = min(open_clip, remaining)
+                if post_qty > 0:
+                    orders.append(Order(product, ask_quote, -post_qty))
+            # Also post a cover bid if already short from a prior day.
+            if pos < 0:
+                cover_half = max(1.0, base_half * 0.9)
+                bid_quote  = min(best_bid, math.floor(fair - cover_half))
+                if bid_quote > 0:
+                    cover_qty = min(
+                        max(2, abs(pos) // 12),
+                        abs(pos),
+                        max(4, clip // 2),
+                    )
+                    if cover_qty > 0:
+                        orders.append(Order(product, bid_quote, cover_qty))
+            return orders
+ 
+        # --- Normal trading logic (ts >= OPEN_SKIP_TICKS) ---
+ 
         remaining_short = max(0, cap + pos)   # pos is ≤ 0 here
-
-        # --- Aggressive SELL: hit bid when it is clearly above FV ---
+ 
+        # Aggressive SELL: cross the bid when it is clearly above FV.
+        # The 0.55 × sell_half threshold ensures we only trade when the market
+        # is offering us meaningful edge, not just the passive half-spread.
         if remaining_short > 0 and best_bid >= fair + 0.55 * sell_half:
             qty = min(clip, remaining_short, od.buy_orders[best_bid])
             if qty > 0:
                 orders.append(Order(product, best_bid, -qty))
                 pos             -= qty
                 remaining_short -= qty
-
-        # --- Passive ask: post at FV + sell_half ---
-        improve   = 1 if strike_flow > 1.25 and (best_ask - best_bid) >= 2 else 0
+ 
+        # Passive ask: rest at FV + sell_half.
+        # If Mark 01 flow is strong and the spread is wide enough, improve
+        # one tick to increase fill probability into their informed demand.
+        improve    = 1 if strike_flow > 1.25 and (best_ask - best_bid) >= 2 else 0
         ask_target = math.ceil(fair + sell_half)
         ask_quote  = max(
             best_bid + 1,
@@ -639,8 +692,10 @@ class Trader:
             post_qty = min(clip, remaining_short)
             if post_qty > 0:
                 orders.append(Order(product, ask_quote, -post_qty))
-
-        # --- Passive cover bid: slowly buy back short ---
+ 
+        # Passive cover bid: slowly buy back short position at FV − cover_half.
+        # Rate-limited to 1/12 of position per tick to avoid rushing the unwind
+        # and paying up unnecessarily (floor is 2, ceiling is clip // 2).
         if pos < 0:
             cover_half = max(1.0, base_half * 0.9)
             bid_quote  = min(best_bid, math.floor(fair - cover_half))
@@ -652,5 +707,5 @@ class Trader:
                 )
                 if cover_qty > 0:
                     orders.append(Order(product, bid_quote, cover_qty))
-
+ 
         return orders
