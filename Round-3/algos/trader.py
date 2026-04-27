@@ -656,37 +656,8 @@ class Trader:
         trader_data["last_ts"] = ts
         # day = trader_data["current_day"]
 
-        
-        trader_data.setdefault("day_offset", None)
-        if trader_data["day_offset"] is None:
-            # Back-solve absolute day from ATM option prices at session open.
-            # Try each candidate day offset; pick the one whose implied vol
-            # is closest to the calibrated prior.
-            S_init = trader_data.get("last_S", 5250.0)
-            best_offset, best_err = 0, float("inf")
-            for product in ["VEV_5200", "VEV_5100", "VEV_5300"]:
-                depth = state.order_depths.get(product)
-                if depth is None:
-                    continue
-                mid = get_mid_price(depth)
-                if mid is None:
-                    continue
-                K = STRIKES[product]
-                sigma_prior = BASE_IV[product]
-                for d in range(TOTAL_TTE_DAYS):
-                    T = tte_years(d, state.timestamp)
-                    if T <= 0:
-                        continue
-                    iv = implied_vol(mid, S_init, K, T)
-                    if iv is None:
-                        continue
-                    err = abs(iv - sigma_prior)
-                    if err < best_err:
-                        best_err, best_offset = err, d
-                break  # one liquid product is enough
-            trader_data["day_offset"] = best_offset
-
-        day = trader_data["current_day"] + trader_data["day_offset"]
+        DAY_START = 2  # confirmed from backtest logs
+        day = trader_data["current_day"] + DAY_START
 
         # 4. Log snapshot
         self._log_state(state, day, S)
